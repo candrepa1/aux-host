@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const { auth, requiresAuth } = require('express-openid-connect');
+const { auth: jwtAuth } = require('express-oauth2-jwt-bearer');
 const { fetchGuestTaste, queueTracks, skipCurrentTrack } = require('./agent');
 
 const app = express();
@@ -21,6 +22,51 @@ const config = {
 };
 
 app.use(auth(config));
+
+// JWT validation for Bearer token auth (iOS app)
+const checkJwt = jwtAuth({
+  audience: process.env.AUTH0_AUDIENCE,
+  issuerBaseURL: process.env.AUTH_ISSUER_BASE_URL,
+  tokenSigningAlg: 'RS256',
+});
+
+// Unified auth middleware: supports both session (browser) and Bearer token (iOS)
+function requiresAuthUnified() {
+  return async (req, res, next) => {
+    // Check if there's a valid OIDC session (browser)
+    if (req.oidc?.isAuthenticated()) {
+      req.user = {
+        sub: req.oidc.user.sub,
+        name: req.oidc.user.name || req.oidc.user.email,
+        email: req.oidc.user.email,
+        refreshToken: req.oidc.refreshToken,
+      };
+      return next();
+    }
+
+    // Check for Bearer token (iOS app)
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      checkJwt(req, res, (err) => {
+        if (err) {
+          return res.status(401).json({ error: 'Invalid token' });
+        }
+        // req.auth is set by express-oauth2-jwt-bearer
+        req.user = {
+          sub: req.auth.payload.sub,
+          name: req.auth.payload.name || req.auth.payload.email || req.auth.payload.sub,
+          email: req.auth.payload.email,
+          // iOS app must send refresh token in the request body for Token Vault
+          refreshToken: req.body?.refreshToken,
+        };
+        next();
+      });
+      return;
+    }
+
+    res.status(401).json({ error: 'Authentication required' });
+  };
+}
 
 // In-memory party state (replace with DB later)
 const parties = new Map();
@@ -62,7 +108,7 @@ function blendTastes(guestTastes) {
 
 // Middleware: check if current user is the party host
 function requiresHost(req, res, party) {
-  if (party.host !== req.oidc.user.sub) {
+  if (party.host !== req.user.sub) {
     res.status(403).json({ error: 'Only the host can do this' });
     return false;
   }
@@ -70,42 +116,40 @@ function requiresHost(req, res, party) {
 }
 
 // Host creates a party
-app.post('/party', requiresAuth(), (req, res) => {
+app.post('/party', requiresAuthUnified(), (req, res) => {
   const partyId = Math.random().toString(36).substring(2, 8);
-  const user = req.oidc.user;
-  const refreshToken = req.oidc.refreshToken;
+  const { sub, name, email, refreshToken } = req.user;
 
   if (!refreshToken) {
-    return res.status(400).json({ error: 'No refresh token. Re-login.' });
+    return res.status(400).json({ error: 'No refresh token. Send refreshToken in request body.' });
   }
 
   parties.set(partyId, {
-    host: user.sub,
-    hostName: user.name || user.email,
+    host: sub,
+    hostName: name || email,
     hostRefreshToken: refreshToken,
     guests: {},
     queue: [],
     createdAt: new Date(),
   });
 
-  res.json({ partyId, joinUrl: `http://localhost:3000/party/${partyId}/join` });
+  res.json({ partyId });
 });
 
 // Guest joins a party (must be logged in with Spotify connected)
-app.post('/party/:id/join', requiresAuth(), async (req, res) => {
+app.post('/party/:id/join', requiresAuthUnified(), async (req, res) => {
   const party = parties.get(req.params.id);
   if (!party) return res.status(404).json({ error: 'Party not found' });
 
-  const user = req.oidc.user;
-  const refreshToken = req.oidc.refreshToken;
+  const { sub, name, email, refreshToken } = req.user;
   if (!refreshToken) {
-    return res.status(400).json({ error: 'No refresh token. Re-login with Spotify.' });
+    return res.status(400).json({ error: 'No refresh token. Send refreshToken in request body.' });
   }
 
   try {
     const taste = await fetchGuestTaste(refreshToken);
-    party.guests[user.sub] = {
-      name: user.name || user.email,
+    party.guests[sub] = {
+      name: name || email,
       taste,
       joinedAt: new Date(),
     };
@@ -115,7 +159,7 @@ app.post('/party/:id/join', requiresAuth(), async (req, res) => {
     party.queue = blendTastes(allTastes);
 
     res.json({
-      message: `${user.name || user.email} joined the party!`,
+      message: `${name || email} joined the party!`,
       guestCount: Object.keys(party.guests).length,
       queueLength: party.queue.length,
     });
@@ -156,7 +200,7 @@ app.get('/party/:id', (req, res) => {
 });
 
 // Host: push top N blended tracks to Spotify queue
-app.post('/party/:id/play', requiresAuth(), async (req, res) => {
+app.post('/party/:id/play', requiresAuthUnified(), async (req, res) => {
   const party = parties.get(req.params.id);
   if (!party) return res.status(404).json({ error: 'Party not found' });
   if (!requiresHost(req, res, party)) return;
@@ -174,7 +218,7 @@ app.post('/party/:id/play', requiresAuth(), async (req, res) => {
 });
 
 // Host: skip current track
-app.post('/party/:id/skip', requiresAuth(), async (req, res) => {
+app.post('/party/:id/skip', requiresAuthUnified(), async (req, res) => {
   const party = parties.get(req.params.id);
   if (!party) return res.status(404).json({ error: 'Party not found' });
   if (!requiresHost(req, res, party)) return;
