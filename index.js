@@ -3,6 +3,7 @@ const express = require('express');
 const { auth, requiresAuth } = require('express-openid-connect');
 const { auth: jwtAuth } = require('express-oauth2-jwt-bearer');
 const { fetchGuestTaste, queueTracks, skipCurrentTrack } = require('./agent');
+const { initDB, createParty, getParty, addGuest, saveQueue } = require('./db');
 
 const app = express();
 app.use(express.json());
@@ -49,7 +50,8 @@ function requiresAuthUnified() {
     if (authHeader?.startsWith('Bearer ')) {
       checkJwt(req, res, (err) => {
         if (err) {
-          return res.status(401).json({ error: 'Invalid token' });
+          console.error('JWT validation error:', err.message);
+          return res.status(401).json({ error: 'Invalid token', details: err.message });
         }
         // req.auth is set by express-oauth2-jwt-bearer
         req.user = {
@@ -68,8 +70,8 @@ function requiresAuthUnified() {
   };
 }
 
-// In-memory party state (replace with DB later)
-const parties = new Map();
+// Initialize database tables on startup
+initDB().then(() => console.log('Database initialized')).catch(console.error);
 
 app.get('/', (req, res) => {
   res.send(req.oidc.isAuthenticated() ? 'Logged in' : 'Logged out');
@@ -116,7 +118,7 @@ function requiresHost(req, res, party) {
 }
 
 // Host creates a party
-app.post('/party', requiresAuthUnified(), (req, res) => {
+app.post('/party', requiresAuthUnified(), async (req, res) => {
   const partyId = Math.random().toString(36).substring(2, 8);
   const { sub, name, email, refreshToken } = req.user;
 
@@ -124,21 +126,22 @@ app.post('/party', requiresAuthUnified(), (req, res) => {
     return res.status(400).json({ error: 'No refresh token. Send refreshToken in request body.' });
   }
 
-  parties.set(partyId, {
-    host: sub,
-    hostName: name || email,
-    hostRefreshToken: refreshToken,
-    guests: {},
-    queue: [],
-    createdAt: new Date(),
-  });
-
-  res.json({ partyId });
+  try {
+    await createParty(partyId, {
+      host: sub,
+      hostName: name || email,
+      hostRefreshToken: refreshToken,
+    });
+    res.json({ partyId });
+  } catch (err) {
+    console.error('Create party error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Guest joins a party (must be logged in with Spotify connected)
 app.post('/party/:id/join', requiresAuthUnified(), async (req, res) => {
-  const party = parties.get(req.params.id);
+  const party = await getParty(req.params.id);
   if (!party) return res.status(404).json({ error: 'Party not found' });
 
   const { sub, name, email, refreshToken } = req.user;
@@ -148,20 +151,18 @@ app.post('/party/:id/join', requiresAuthUnified(), async (req, res) => {
 
   try {
     const taste = await fetchGuestTaste(refreshToken);
-    party.guests[sub] = {
-      name: name || email,
-      taste,
-      joinedAt: new Date(),
-    };
+    await addGuest(req.params.id, sub, name || email, taste);
 
     // Re-blend the queue every time someone joins
+    party.guests[sub] = { name: name || email, taste };
     const allTastes = Object.values(party.guests).map((g) => g.taste);
-    party.queue = blendTastes(allTastes);
+    const queue = blendTastes(allTastes);
+    await saveQueue(req.params.id, queue);
 
     res.json({
       message: `${name || email} joined the party!`,
       guestCount: Object.keys(party.guests).length,
-      queueLength: party.queue.length,
+      queueLength: queue.length,
     });
   } catch (err) {
     console.error('Join error:', err);
@@ -170,8 +171,8 @@ app.post('/party/:id/join', requiresAuthUnified(), async (req, res) => {
 });
 
 // Get the blended queue for a party
-app.get('/party/:id/queue', (req, res) => {
-  const party = parties.get(req.params.id);
+app.get('/party/:id/queue', async (req, res) => {
+  const party = await getParty(req.params.id);
   if (!party) return res.status(404).json({ error: 'Party not found' });
 
   const limit = parseInt(req.query.limit) || 20;
@@ -185,8 +186,8 @@ app.get('/party/:id/queue', (req, res) => {
 });
 
 // Get party info
-app.get('/party/:id', (req, res) => {
-  const party = parties.get(req.params.id);
+app.get('/party/:id', async (req, res) => {
+  const party = await getParty(req.params.id);
   if (!party) return res.status(404).json({ error: 'Party not found' });
 
   res.json({
@@ -201,7 +202,7 @@ app.get('/party/:id', (req, res) => {
 
 // Host: push top N blended tracks to Spotify queue
 app.post('/party/:id/play', requiresAuthUnified(), async (req, res) => {
-  const party = parties.get(req.params.id);
+  const party = await getParty(req.params.id);
   if (!party) return res.status(404).json({ error: 'Party not found' });
   if (!requiresHost(req, res, party)) return;
 
@@ -219,7 +220,7 @@ app.post('/party/:id/play', requiresAuthUnified(), async (req, res) => {
 
 // Host: skip current track
 app.post('/party/:id/skip', requiresAuthUnified(), async (req, res) => {
-  const party = parties.get(req.params.id);
+  const party = await getParty(req.params.id);
   if (!party) return res.status(404).json({ error: 'Party not found' });
   if (!requiresHost(req, res, party)) return;
 
