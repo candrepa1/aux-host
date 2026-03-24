@@ -12,7 +12,7 @@ const config = {
   authRequired: false,
   auth0Logout: true,
   secret: process.env.AUTH_SECRET,
-  baseURL: 'http://localhost:3000',
+  baseURL: process.env.BASE_URL || 'http://localhost:3000',
   clientID: process.env.AUTH_CLIENT_ID,
   clientSecret: process.env.AUTH_CLIENT_SECRET,
   issuerBaseURL: process.env.AUTH_ISSUER_BASE_URL,
@@ -74,7 +74,71 @@ function requiresAuthUnified() {
 initDB().then(() => console.log('Database initialized')).catch(console.error);
 
 app.get('/', (req, res) => {
-  res.send(req.oidc.isAuthenticated() ? 'Logged in' : 'Logged out');
+  if (req.oidc.isAuthenticated()) {
+    res.send(`
+      <h2>Logged in as ${req.oidc.user.name || req.oidc.user.email}</h2>
+      <p>Refresh token: ${req.oidc.refreshToken ? 'Yes' : 'No'}</p>
+      <br/>
+      <a href="/test/host">Create a Party</a> |
+      <a href="/logout">Logout</a>
+    `);
+  } else {
+    res.send('<a href="/login">Login with Spotify</a>');
+  }
+});
+
+// Test: host creates a party via browser session
+app.get('/test/host', requiresAuth(), async (req, res) => {
+  const partyId = Math.random().toString(36).substring(2, 8);
+  const refreshToken = req.oidc.refreshToken;
+  if (!refreshToken) return res.send('No refresh token in session');
+
+  try {
+    await createParty(partyId, {
+      host: req.oidc.user.sub,
+      hostName: req.oidc.user.name || req.oidc.user.email,
+      hostRefreshToken: refreshToken,
+    });
+    res.send(`
+      <h2>Party created: ${partyId}</h2>
+      <p>Share this code with guests.</p>
+      <br/>
+      <a href="/test/join/${partyId}">Join as guest (same account)</a> |
+      <a href="/">Home</a>
+    `);
+  } catch (err) {
+    res.status(500).send(`Error: ${err.message}`);
+  }
+});
+
+// Test: guest joins a party via browser session
+app.get('/test/join/:id', requiresAuth(), async (req, res) => {
+  const party = await getParty(req.params.id);
+  if (!party) return res.status(404).send('Party not found');
+
+  const refreshToken = req.oidc.refreshToken;
+  if (!refreshToken) return res.send('No refresh token in session');
+
+  try {
+    const taste = await fetchGuestTaste(refreshToken);
+    const name = req.oidc.user.name || req.oidc.user.email;
+    await addGuest(req.params.id, req.oidc.user.sub, name, taste);
+
+    party.guests[req.oidc.user.sub] = { name, taste };
+    const allTastes = Object.values(party.guests).map((g) => g.taste);
+    const queue = blendTastes(allTastes);
+    await saveQueue(req.params.id, queue);
+
+    res.send(`
+      <h2>Joined party ${req.params.id}!</h2>
+      <p>Guests: ${Object.keys(party.guests).length}</p>
+      <p>Queue: ${queue.length} tracks</p>
+      <br/>
+      <a href="/">Home</a>
+    `);
+  } catch (err) {
+    res.status(500).send(`Error: ${err.message}`);
+  }
 });
 
 app.get('/profile', requiresAuth(), (req, res) => {
