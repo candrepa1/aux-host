@@ -180,6 +180,24 @@ const skipTrack = withSpotifyHost(
  * Returns scored tracks from top tracks, recently played, and saved library.
  */
 async function fetchGuestTaste(refreshToken) {
+  // Debug: test the token exchange directly
+  const exchangeRes = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'urn:auth0:params:oauth:grant-type:token-exchange:federated-connection-access-token',
+      client_id: process.env.AUTH_CLIENT_ID,
+      client_secret: process.env.AUTH_CLIENT_SECRET,
+      subject_token_type: 'urn:ietf:params:oauth:token-type:refresh_token',
+      subject_token: refreshToken,
+      connection: 'spotify',
+      requested_token_type: 'http://auth0.com/oauth/token-type/federated-connection-access-token',
+    }),
+  });
+  const exchangeBody = await exchangeRes.text();
+  console.log('Token exchange status:', exchangeRes.status);
+  console.log('Token exchange response:', exchangeBody);
+
   const config = { configurable: { _credentials: { refreshToken } } };
 
   const [topRaw, recentRaw, savedRaw] = await Promise.all([
