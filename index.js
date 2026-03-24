@@ -81,6 +81,11 @@ app.get('/', (req, res) => {
       <br/>
       <a href="/test/host">Create a Party</a> |
       <a href="/logout">Logout</a>
+      <br/><br/>
+      <form action="/test/join" method="get" style="display:inline">
+        <input name="code" placeholder="Party code" />
+        <button type="submit">Join Party</button>
+      </form>
     `);
   } else {
     res.send('<a href="/login">Login with Spotify</a>');
@@ -109,6 +114,13 @@ app.get('/test/host', requiresAuth(), async (req, res) => {
   } catch (err) {
     res.status(500).send(`Error: ${err.message}`);
   }
+});
+
+// Test: guest joins via query param
+app.get('/test/join', requiresAuth(), (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.send('No party code provided');
+  res.redirect(`/test/join/${code.trim().toLowerCase()}`);
 });
 
 // Test: guest joins a party via browser session
